@@ -1,0 +1,376 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pase de lista · Profesor</title>
+  <link rel="stylesheet" href="estilos.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js"></script>
+</head>
+<body>
+  <header class="barra">
+    <h1>Pase de lista · Profesor</h1>
+    <div class="usuario" id="usuario" hidden>
+      <span id="usuario-correo"></span>
+      <button class="enlace" id="btn-salir" type="button">Salir</button>
+    </div>
+  </header>
+
+  <main class="ancho">
+    <section id="v-cargando" class="tarjeta"><p>Cargando…</p></section>
+
+    <!-- Iniciar sesión -->
+    <section id="v-login" style="max-width:480px;margin:0 auto" hidden>
+      <div class="tarjeta">
+        <h2>Entrar como profesor</h2>
+        <p>Usa la cuenta que registraste en la colección <code>profesores</code> de Firestore.</p>
+        <button id="btn-login" type="button">Entrar con mi cuenta</button>
+      </div>
+    </section>
+
+    <!-- Cuenta sin permiso de profesor -->
+    <section id="v-no-autorizado" style="max-width:640px;margin:0 auto" hidden>
+      <div class="tarjeta">
+        <h2 class="error">Esta cuenta no está registrada como profesor</h2>
+        <p>Para habilitarla, en la consola de Firebase abre <b>Firestore Database</b> y crea:</p>
+        <p>Colección: <code>profesores</code><br>ID del documento: <code id="na-correo"></code><br>Campo: <code>nombre</code> (string) con tu nombre.</p>
+        <button id="btn-reintentar" class="secundario" type="button">Ya lo hice, volver a revisar</button>
+      </div>
+    </section>
+
+    <!-- Panel: abrir sesión o elegir una reciente -->
+    <section id="v-panel" hidden>
+      <div class="rejilla">
+        <div class="tarjeta">
+          <div class="etiqueta">Nueva sesión</div>
+          <h2>Abrir pase de lista</h2>
+          <label for="f-materia">Materia</label>
+          <input type="text" id="f-materia" placeholder="Base de datos NoSQL" maxlength="80">
+          <label for="f-grupo">Grupo</label>
+          <input type="text" id="f-grupo" placeholder="IDGS-5A" maxlength="30">
+          <p></p>
+          <button id="btn-abrir" class="principal" type="button">Abrir y mostrar QR</button>
+          <p class="nota error" id="p-error"></p>
+        </div>
+        <div class="tarjeta">
+          <div class="etiqueta">Historial</div>
+          <h2>Mis sesiones</h2>
+          <ul class="sesiones" id="lista-sesiones"><li class="nota">Cargando…</li></ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- Sesión en vivo (para proyectar) -->
+    <section id="v-vivo" hidden>
+      <div class="rejilla">
+        <div>
+          <div class="qr-caja">
+            <div class="etiqueta" id="vv-titulo">Materia · Grupo</div>
+            <div id="qr"><img id="qr-img" alt="Código QR para registrar asistencia"></div>
+            <div id="vv-estado-qr" class="centro">
+              <div class="codigo-grande" id="vv-codigo">······</div>
+              <div class="cuenta" id="vv-cuenta">El código cambia en 60 s</div>
+            </div>
+            <div class="barra-tiempo"><div id="vv-barra" style="width:100%"></div></div>
+            <div class="url-sesion" id="vv-url"></div>
+          </div>
+          <p></p>
+          <div class="acciones">
+            <button id="btn-cerrar" type="button">Cerrar pase de lista</button>
+            <button id="btn-csv" class="secundario" type="button">Descargar CSV</button>
+            <button id="btn-volver" class="secundario" type="button">Volver</button>
+          </div>
+        </div>
+        <div>
+          <div class="tarjeta">
+            <div class="contador"><span class="numero" id="vv-total">0</span><span class="texto">alumnos presentes</span></div>
+            <ol class="lista" id="vv-lista"></ol>
+          </div>
+          <div class="tarjeta">
+            <div class="etiqueta">Así se guarda en Firestore</div>
+            <p class="nota" id="vv-ruta">Esperando el primer registro…</p>
+            <pre class="json" id="vv-json">{ }</pre>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script type="module">
+    import {
+      auth, db, onAuthStateChanged, iniciarSesion, cerrarSesion, mensajeDeError, formatearHora, mostrar
+    } from "./comun.js";
+    import { ROTACION_SEGUNDOS } from "./firebase-config.js";
+    import {
+      doc, getDoc, setDoc, addDoc, updateDoc, collection, query, where, orderBy,
+      onSnapshot, getDocs, serverTimestamp
+    } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+
+    const VISTAS = ["v-cargando", "v-login", "v-no-autorizado", "v-panel", "v-vivo"];
+    const $ = (id) => document.getElementById(id);
+
+    let correo = null;
+    let sesionActual = null;   // { id, materia, grupo, fecha, abierta }
+    let codigoActual = null;
+    let temporizador = null;
+    let segundosRestantes = 0;
+    let dejarDeEscuchar = null;
+    let registros = [];
+
+    // ---------- Acceso ----------
+    onAuthStateChanged(auth, async (usuario) => {
+      detenerSesionEnVivo();
+      if (!usuario) {
+        $("usuario").hidden = true;
+        mostrar("v-login", VISTAS);
+        return;
+      }
+      correo = (usuario.email || "").toLowerCase();
+      $("usuario").hidden = false;
+      $("usuario-correo").textContent = correo;
+      await revisarProfesor();
+    });
+
+    async function revisarProfesor() {
+      mostrar("v-cargando", VISTAS);
+      try {
+        const perfil = await getDoc(doc(db, "profesores", correo));
+        if (!perfil.exists()) {
+          $("na-correo").textContent = correo;
+          mostrar("v-no-autorizado", VISTAS);
+          return;
+        }
+        mostrar("v-panel", VISTAS);
+        cargarSesiones();
+      } catch (e) {
+        $("na-correo").textContent = correo;
+        mostrar("v-no-autorizado", VISTAS);
+      }
+    }
+
+    $("btn-login").addEventListener("click", async () => {
+      try { await iniciarSesion(); } catch (e) { alert(mensajeDeError(e)); }
+    });
+    $("btn-salir").addEventListener("click", () => cerrarSesion());
+    $("btn-reintentar").addEventListener("click", () => revisarProfesor());
+
+    // ---------- Historial de sesiones ----------
+    async function cargarSesiones() {
+      const ul = $("lista-sesiones");
+      try {
+        const res = await getDocs(query(collection(db, "sesiones"), where("profesor", "==", correo)));
+        const sesiones = res.docs.map(d => ({ id: d.id, ...d.data() }))
+          .sort((a, b) => (b.creada?.toMillis?.() || 0) - (a.creada?.toMillis?.() || 0))
+          .slice(0, 15);
+        ul.innerHTML = "";
+        if (sesiones.length === 0) {
+          ul.innerHTML = '<li class="nota">Aún no tienes sesiones.</li>';
+          return;
+        }
+        for (const s of sesiones) {
+          const li = document.createElement("li");
+          const b = document.createElement("button");
+          b.type = "button";
+          const texto = document.createElement("span");
+          texto.textContent = `${s.fecha} · ${s.materia} · ${s.grupo}`;
+          const pastilla = document.createElement("span");
+          pastilla.className = "pastilla " + (s.abierta ? "abierta" : "cerrada");
+          pastilla.textContent = s.abierta ? "Abierta" : "Cerrada";
+          b.append(texto, pastilla);
+          b.addEventListener("click", () => entrarASesion(s));
+          li.append(b);
+          ul.append(li);
+        }
+      } catch (e) {
+        ul.innerHTML = "";
+        const li = document.createElement("li");
+        li.className = "nota error";
+        li.textContent = mensajeDeError(e);
+        ul.append(li);
+      }
+    }
+
+    // ---------- Abrir una sesión nueva ----------
+    $("btn-abrir").addEventListener("click", async () => {
+      const materia = $("f-materia").value.trim();
+      const grupo = $("f-grupo").value.trim();
+      $("p-error").textContent = "";
+      if (!materia || !grupo) { $("p-error").textContent = "Escribe la materia y el grupo."; return; }
+      $("btn-abrir").disabled = true;
+      try {
+        const hoy = new Date();
+        const fecha = `${hoy.getFullYear()}-${String(hoy.getMonth() + 1).padStart(2, "0")}-${String(hoy.getDate()).padStart(2, "0")}`;
+        const datos = { materia, grupo, fecha, profesor: correo, abierta: true, creada: serverTimestamp() };
+        const ref = await addDoc(collection(db, "sesiones"), datos);
+        await entrarASesion({ id: ref.id, ...datos });
+      } catch (e) {
+        $("p-error").textContent = mensajeDeError(e);
+      } finally {
+        $("btn-abrir").disabled = false;
+      }
+    });
+
+    // ---------- Sesión en vivo ----------
+    async function entrarASesion(s) {
+      sesionActual = { id: s.id, materia: s.materia, grupo: s.grupo, fecha: s.fecha, abierta: !!s.abierta };
+      $("vv-titulo").textContent = `${s.materia} · ${s.grupo} · ${s.fecha}`;
+      registros = [];
+      $("vv-lista").innerHTML = "";
+      $("vv-total").textContent = "0";
+      $("vv-json").textContent = "{ }";
+      $("vv-ruta").textContent = "Esperando el primer registro…";
+      mostrar("v-vivo", VISTAS);
+
+      pintarEstado();
+      if (sesionActual.abierta) await rotarCodigo();
+      escucharAsistencias();
+    }
+
+    // Dibuja el QR con la librería qrcode-generator (tamaño automático, corrección de errores media).
+    function dibujarQR(texto) {
+      const q = qrcode(0, "M");
+      q.addData(texto);
+      q.make();
+      $("qr-img").src = q.createDataURL(10, 2);
+    }
+
+    function nuevoCodigo() {
+      const letras = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // sin O/0 ni I/1 para evitar confusiones
+      const azar = new Uint32Array(6);
+      crypto.getRandomValues(azar);
+      return Array.from(azar, n => letras[n % letras.length]).join("");
+    }
+
+    // Genera un código nuevo, lo guarda en la parte privada de la sesión y actualiza el QR.
+    // Se conserva el anterior para que quien escaneó justo antes del cambio también pueda registrarse.
+    async function rotarCodigo() {
+      const anterior = codigoActual || "";
+      const nuevo = nuevoCodigo();
+      await setDoc(doc(db, "sesiones", sesionActual.id, "privado", "codigo"), {
+        valor: nuevo,
+        anterior: anterior || nuevo
+      });
+      codigoActual = nuevo;
+      const url = new URL("index.html", location.href);
+      url.search = new URLSearchParams({ s: sesionActual.id, c: nuevo }).toString();
+      dibujarQR(url.toString());
+      $("vv-codigo").textContent = nuevo;
+      $("vv-url").textContent = url.toString();
+
+      segundosRestantes = ROTACION_SEGUNDOS;
+      clearInterval(temporizador);
+      temporizador = setInterval(async () => {
+        segundosRestantes--;
+        $("vv-cuenta").textContent = `El código cambia en ${Math.max(segundosRestantes, 0)} s`;
+        $("vv-barra").style.width = `${Math.max(segundosRestantes, 0) / ROTACION_SEGUNDOS * 100}%`;
+        if (segundosRestantes <= 0) {
+          clearInterval(temporizador);
+          try { await rotarCodigo(); } catch (e) { $("vv-cuenta").textContent = mensajeDeError(e); }
+        }
+      }, 1000);
+      $("vv-cuenta").textContent = `El código cambia en ${ROTACION_SEGUNDOS} s`;
+      $("vv-barra").style.width = "100%";
+    }
+
+    function escucharAsistencias() {
+      if (dejarDeEscuchar) dejarDeEscuchar();
+      const q = query(collection(db, "sesiones", sesionActual.id, "asistencias"), orderBy("hora", "asc"));
+      // onSnapshot: Firestore avisa en tiempo real cada vez que llega un documento nuevo.
+      dejarDeEscuchar = onSnapshot(q, (snap) => {
+        let ultimo = null;
+        for (const cambio of snap.docChanges()) {
+          if (cambio.type === "added") ultimo = cambio.doc;
+        }
+        registros = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+        pintarLista(ultimo ? ultimo.id : null);
+        if (ultimo) mostrarJson(ultimo);
+      }, (e) => {
+        $("vv-ruta").textContent = mensajeDeError(e);
+      });
+    }
+
+    function pintarLista(idNuevo) {
+      const ol = $("vv-lista");
+      ol.innerHTML = "";
+      registros.forEach((r, i) => {
+        const li = document.createElement("li");
+        if (r.id === idNuevo) li.className = "nuevo";
+        const num = document.createElement("span"); num.className = "num"; num.textContent = i + 1;
+        const quien = document.createElement("div");
+        const n = document.createElement("div"); n.className = "nombre"; n.textContent = r.nombre;
+        const c = document.createElement("div"); c.className = "correo"; c.textContent = r.correo;
+        quien.append(n, c);
+        const h = document.createElement("span"); h.className = "hora"; h.textContent = formatearHora(r.hora);
+        li.append(num, quien, h);
+        ol.append(li);
+      });
+      $("vv-total").textContent = registros.length;
+      if (idNuevo) ol.scrollTop = ol.scrollHeight;
+    }
+
+    function mostrarJson(d) {
+      const datos = d.data();
+      const visible = {};
+      for (const [k, v] of Object.entries(datos)) {
+        visible[k] = (v && typeof v.toDate === "function") ? v.toDate().toISOString() : v;
+      }
+      $("vv-ruta").textContent = `sesiones / ${sesionActual.id} / asistencias / ${d.id}`;
+      $("vv-json").textContent = JSON.stringify(visible, null, 2);
+    }
+
+    function pintarEstado() {
+      const abierta = sesionActual.abierta;
+      $("btn-cerrar").textContent = abierta ? "Cerrar pase de lista" : "Reabrir pase de lista";
+      $("qr").style.opacity = abierta ? "1" : "0.12";
+      if (!abierta) {
+        clearInterval(temporizador);
+        $("vv-codigo").textContent = "CERRADO";
+        $("vv-cuenta").textContent = "Ya no se aceptan registros";
+        $("vv-barra").style.width = "0%";
+      }
+    }
+
+    $("btn-cerrar").addEventListener("click", async () => {
+      $("btn-cerrar").disabled = true;
+      try {
+        const abrir = !sesionActual.abierta;
+        await updateDoc(doc(db, "sesiones", sesionActual.id), { abierta: abrir });
+        sesionActual.abierta = abrir;
+        pintarEstado();
+        if (abrir) await rotarCodigo();
+      } catch (e) {
+        alert(mensajeDeError(e));
+      } finally {
+        $("btn-cerrar").disabled = false;
+      }
+    });
+
+    $("btn-csv").addEventListener("click", () => {
+      const filas = [["numero", "nombre", "correo", "hora", "dispositivo"]];
+      registros.forEach((r, i) => {
+        const hora = r.hora && r.hora.toDate ? r.hora.toDate().toLocaleString("es-MX") : "";
+        filas.push([i + 1, r.nombre, r.correo, hora, r.dispositivo || ""]);
+      });
+      const csv = "﻿" + filas.map(f => f.map(v => `"${String(v).replace(/"/g, '""')}"`).join(",")).join("\r\n");
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+      a.download = `asistencia_${sesionActual.grupo}_${sesionActual.fecha}.csv`.replace(/[^\w.-]+/g, "_");
+      a.click();
+      URL.revokeObjectURL(a.href);
+    });
+
+    function detenerSesionEnVivo() {
+      clearInterval(temporizador);
+      if (dejarDeEscuchar) { dejarDeEscuchar(); dejarDeEscuchar = null; }
+      codigoActual = null;
+      sesionActual = null;
+    }
+
+    $("btn-volver").addEventListener("click", () => {
+      detenerSesionEnVivo();
+      mostrar("v-panel", VISTAS);
+      cargarSesiones();
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,102 @@
+rules_version = '2';
+
+// ============================================================
+//  REGLAS DE SEGURIDAD DEL PASE DE LISTA
+//  Pégalas en: Consola de Firebase > Firestore Database > Reglas > Publicar
+//
+//  Si tu dominio institucional NO es uthh.edu.mx, cambia la
+//  expresión de la función esInstitucional() (los puntos van como [.]).
+// ============================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ¿La persona inició sesión con un correo institucional?
+    function esInstitucional() {
+      return request.auth != null
+        && request.auth.token.email is string
+        && request.auth.token.email.lower().matches('.*@uthh[.]edu[.]mx$')
+        && (request.auth.token.email_verified == true
+            || request.auth.token.firebase.sign_in_provider == 'microsoft.com');
+    }
+
+    // ¿Su correo está dado de alta en la colección "profesores"?
+    function esProfesor() {
+      return request.auth != null
+        && request.auth.token.email is string
+        && exists(/databases/$(database)/documents/profesores/$(request.auth.token.email.lower()));
+    }
+
+    function sesion(sesionId) {
+      return get(/databases/$(database)/documents/sesiones/$(sesionId)).data;
+    }
+
+    function esDuenoDeSesion(sesionId) {
+      return esProfesor() && sesion(sesionId).profesor == request.auth.token.email.lower();
+    }
+
+    // El código enviado debe ser el vigente o el inmediato anterior.
+    function codigoValido(sesionId, codigo) {
+      let privado = get(/databases/$(database)/documents/sesiones/$(sesionId)/privado/codigo).data;
+      return codigo == privado.valor || codigo == privado.anterior;
+    }
+
+    // ---------- profesores/{correo} ----------
+    // Se dan de alta a mano desde la consola. Cada profesor solo puede leer su propio registro.
+    match /profesores/{correo} {
+      allow read: if request.auth != null
+                  && request.auth.token.email is string
+                  && request.auth.token.email.lower() == correo;
+      allow write: if false;
+    }
+
+    // ---------- sesiones/{sesionId} ----------
+    // Datos públicos de la clase: materia, grupo, fecha, profesor y si está abierta.
+    match /sesiones/{sesionId} {
+      allow read: if esInstitucional() || esProfesor();
+
+      allow create: if esProfesor()
+        && request.resource.data.profesor == request.auth.token.email.lower()
+        && request.resource.data.keys().hasOnly(['materia', 'grupo', 'fecha', 'profesor', 'abierta', 'creada'])
+        && request.resource.data.materia is string && request.resource.data.materia.size() <= 80
+        && request.resource.data.grupo is string && request.resource.data.grupo.size() <= 30
+        && request.resource.data.abierta is bool
+        && request.resource.data.creada == request.time;
+
+      // El profesor dueño solo puede abrir o cerrar el pase de lista.
+      allow update: if esProfesor()
+        && resource.data.profesor == request.auth.token.email.lower()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['abierta'])
+        && request.resource.data.abierta is bool;
+
+      allow delete: if false;
+
+      // ---------- sesiones/{sesionId}/privado/codigo ----------
+      // El código secreto que viaja en el QR. Solo lo ve y lo cambia el profesor dueño.
+      match /privado/{docId} {
+        allow read, write: if esDuenoDeSesion(sesionId);
+      }
+
+      // ---------- sesiones/{sesionId}/asistencias/{uid} ----------
+      // Un documento por alumno; su ID es el uid del alumno.
+      match /asistencias/{uid} {
+        allow create: if esInstitucional()
+          && uid == request.auth.uid
+          && sesion(sesionId).abierta == true
+          && request.resource.data.keys().hasOnly(['nombre', 'correo', 'hora', 'codigo', 'dispositivo'])
+          && request.resource.data.correo == request.auth.token.email
+          && request.resource.data.nombre is string && request.resource.data.nombre.size() <= 120
+          && request.resource.data.dispositivo is string && request.resource.data.dispositivo.size() <= 20
+          && request.resource.data.hora == request.time
+          && codigoValido(sesionId, request.resource.data.codigo);
+
+        // El alumno ve solo su registro; el profesor dueño ve todos.
+        allow read: if (request.auth != null && uid == request.auth.uid)
+                    || esDuenoDeSesion(sesionId);
+
+        // Nadie puede modificar ni borrar una asistencia ya registrada.
+        allow update, delete: if false;
+      }
+    }
+  }
+}

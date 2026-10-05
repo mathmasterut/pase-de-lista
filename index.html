@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pase de lista</title>
+  <link rel="stylesheet" href="estilos.css">
+</head>
+<body>
+  <header class="barra">
+    <h1>Pase de lista</h1>
+    <div class="usuario" id="usuario" hidden>
+      <span id="usuario-correo"></span>
+      <button class="enlace" id="btn-salir" type="button">Salir</button>
+    </div>
+  </header>
+
+  <main>
+    <!-- Se abrió la página sin escanear el QR -->
+    <section id="v-sin-qr" class="tarjeta centro" hidden>
+      <h2>Escanea el código QR</h2>
+      <p>Abre esta página escaneando el código QR que el profesor muestra en el proyector.</p>
+    </section>
+
+    <!-- Cargando -->
+    <section id="v-cargando" class="tarjeta centro">
+      <p>Cargando…</p>
+    </section>
+
+    <!-- Iniciar sesión -->
+    <section id="v-login" class="tarjeta" hidden>
+      <div class="etiqueta">Paso 1 de 2</div>
+      <h2>Entra con tu correo institucional</h2>
+      <p>Solo se aceptan cuentas <b>@<span class="dominio"></span></b>.</p>
+      <button id="btn-login" type="button">Entrar con mi cuenta institucional</button>
+    </section>
+
+    <!-- Registrar asistencia -->
+    <section id="v-registrar" class="tarjeta" hidden>
+      <div class="etiqueta">Paso 2 de 2</div>
+      <h2 id="r-materia">Materia</h2>
+      <p id="r-grupo" class="nota"></p>
+      <p>Hola, <b id="r-nombre"></b>.</p>
+      <button id="btn-presente" class="principal" type="button">Estoy presente</button>
+    </section>
+
+    <!-- Registrado -->
+    <section id="v-listo" class="tarjeta centro" hidden>
+      <div class="palomita" aria-hidden="true">✓</div>
+      <h2>Asistencia registrada</h2>
+      <p id="l-detalle"></p>
+      <p class="nota">Ya puedes cerrar esta página.</p>
+    </section>
+
+    <!-- Error -->
+    <section id="v-error" class="tarjeta" hidden>
+      <h2 class="error">No se pudo completar</h2>
+      <p id="e-mensaje"></p>
+      <button id="btn-reintentar" class="secundario" type="button">Intentar de nuevo</button>
+    </section>
+  </main>
+
+  <script type="module">
+    import {
+      auth, db, onAuthStateChanged, iniciarSesion, cerrarSesion,
+      esCorreoInstitucional, mensajeDeError, formatearHora, mostrar
+    } from "./comun.js";
+    import { DOMINIO } from "./firebase-config.js";
+    import {
+      doc, getDoc, setDoc, serverTimestamp
+    } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+
+    const VISTAS = ["v-sin-qr", "v-cargando", "v-login", "v-registrar", "v-listo", "v-error"];
+    const $ = (id) => document.getElementById(id);
+    document.querySelectorAll(".dominio").forEach(el => el.textContent = DOMINIO);
+
+    // El QR trae la sesión (s) y el código vigente (c) en la dirección.
+    const params = new URLSearchParams(location.search);
+    const sesionId = params.get("s");
+    const codigo = params.get("c");
+
+    function error(msg) {
+      $("e-mensaje").textContent = msg;
+      mostrar("v-error", VISTAS);
+    }
+
+    function tipoDispositivo() {
+      const ua = navigator.userAgent;
+      if (/Android/i.test(ua)) return "Android";
+      if (/iPhone|iPad|iPod/i.test(ua)) return "iOS";
+      if (/Windows/i.test(ua)) return "Windows";
+      if (/Macintosh/i.test(ua)) return "Mac";
+      if (/Linux/i.test(ua)) return "Linux";
+      return "Otro";
+    }
+
+    if (!sesionId || !codigo) {
+      mostrar("v-sin-qr", VISTAS);
+    } else {
+      onAuthStateChanged(auth, async (usuario) => {
+        if (!usuario) {
+          $("usuario").hidden = true;
+          mostrar("v-login", VISTAS);
+          return;
+        }
+        $("usuario").hidden = false;
+        $("usuario-correo").textContent = usuario.email || "";
+
+        if (!esCorreoInstitucional(usuario.email)) {
+          error(`La cuenta ${usuario.email} no es institucional. Sal y entra con tu correo @${DOMINIO}.`);
+          return;
+        }
+
+        mostrar("v-cargando", VISTAS);
+        try {
+          // 1) Datos públicos de la sesión (materia, grupo y si sigue abierta)
+          const sesion = await getDoc(doc(db, "sesiones", sesionId));
+          if (!sesion.exists()) { error("Esta sesión de asistencia no existe. Vuelve a escanear el QR."); return; }
+          const s = sesion.data();
+          $("r-materia").textContent = s.materia || "Asistencia";
+          $("r-grupo").textContent = `Grupo ${s.grupo || ""} · ${s.fecha || ""}`;
+
+          // 2) ¿Ya registré mi asistencia? (el documento se llama como mi uid)
+          const mio = await getDoc(doc(db, "sesiones", sesionId, "asistencias", usuario.uid));
+          if (mio.exists()) {
+            $("l-detalle").textContent = `${s.materia || ""} · registrada a las ${formatearHora(mio.data().hora)}`;
+            mostrar("v-listo", VISTAS);
+            return;
+          }
+          if (!s.abierta) { error("El profesor ya cerró el pase de lista de esta sesión."); return; }
+
+          $("r-nombre").textContent = usuario.displayName || usuario.email;
+          mostrar("v-registrar", VISTAS);
+        } catch (e) {
+          error(mensajeDeError(e));
+        }
+      });
+    }
+
+    $("btn-login").addEventListener("click", async () => {
+      $("btn-login").disabled = true;
+      try { await iniciarSesion(); }
+      catch (e) { error(mensajeDeError(e)); }
+      finally { $("btn-login").disabled = false; }
+    });
+
+    $("btn-presente").addEventListener("click", async () => {
+      const usuario = auth.currentUser;
+      if (!usuario) return;
+      $("btn-presente").disabled = true;
+      try {
+        // Un documento por alumno: sesiones/{sesion}/asistencias/{uid}
+        await setDoc(doc(db, "sesiones", sesionId, "asistencias", usuario.uid), {
+          nombre: usuario.displayName || usuario.email,
+          correo: usuario.email,
+          hora: serverTimestamp(),
+          codigo: codigo,
+          dispositivo: tipoDispositivo()
+        });
+        $("l-detalle").textContent = `Registrada a las ${new Date().toLocaleTimeString("es-MX", { hour: "2-digit", minute: "2-digit" })}`;
+        mostrar("v-listo", VISTAS);
+      } catch (e) {
+        if (e && e.code === "permission-denied") {
+          error("El código del QR ya cambió o el pase de lista se cerró. Vuelve a escanear el QR del proyector.");
+        } else {
+          error(mensajeDeError(e));
+        }
+      } finally {
+        $("btn-presente").disabled = false;
+      }
+    });
+
+    $("btn-salir").addEventListener("click", () => cerrarSesion());
+    $("btn-reintentar").addEventListener("click", () => location.reload());
+  </script>
+</body>
+</html>

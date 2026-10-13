@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Prueba de conexión con IRIS</title>
+<style>
+  :root { --bg: #F3F4F7; --panel: #fff; --tinta: #18213A; --suave: #5A6380; --acento: #2F4BD6; --ok: #1E7B45; --no: #B4322A; --linea: #DCE0EA; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--tinta); font: 15px/1.5 system-ui, "Segoe UI", sans-serif; }
+  main { max-width: 560px; margin: 0 auto; padding: 20px 16px 40px; display: grid; gap: 14px; }
+  h1 { font-size: 1.4rem; margin: 0; }
+  .caja { background: var(--panel); border: 1px solid var(--linea); border-radius: 12px; padding: 14px; display: grid; gap: 10px; }
+  label { font-size: .82rem; font-weight: 600; color: var(--suave); display: grid; gap: 4px; }
+  input { font: inherit; padding: 8px 10px; border: 1px solid var(--linea); border-radius: 8px; width: 100%; }
+  .fila { display: flex; gap: 8px; flex-wrap: wrap; }
+  button { font: 600 .9rem system-ui, sans-serif; padding: 8px 14px; border-radius: 8px; border: 0; background: var(--acento); color: #fff; cursor: pointer; }
+  button.sec { background: transparent; color: var(--acento); border: 1px solid var(--linea); }
+  #estado { font-weight: 600; }
+  .ok { color: var(--ok); } .no { color: var(--no); }
+  pre { background: #141B30; color: #E4E7F0; padding: 10px; border-radius: 8px; overflow-x: auto; font-size: .8rem; margin: 0; white-space: pre-wrap; }
+  ul { margin: 0; padding-left: 18px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Prueba de conexión con IRIS</h1>
+  <p>Esta página está en GitHub Pages y guarda datos en InterSystems IRIS, que corre en tu codespace.</p>
+
+  <section class="caja">
+    <label for="api">Dirección de la API (puerto 52773 público de tu codespace)
+      <input id="api" placeholder="https://tu-codespace-52773.app.github.dev/clinica/api">
+    </label>
+    <div class="fila">
+      <button id="guardarApi" type="button">Guardar dirección</button>
+      <button id="ping" class="sec" type="button">Probar conexión (ping)</button>
+    </div>
+    <div id="estado">Sin probar todavía.</div>
+  </section>
+
+  <section class="caja">
+    <label for="nombre">Escribe tu nombre y guárdalo en IRIS
+      <input id="nombre" maxlength="80" placeholder="Tu nombre">
+    </label>
+    <div class="fila">
+      <button id="enviar" type="button">Guardar en IRIS</button>
+      <button id="listar" class="sec" type="button">Ver lo guardado</button>
+    </div>
+    <ul id="lista"></ul>
+  </section>
+
+  <section class="caja">
+    <strong>Respuesta del servidor</strong>
+    <pre id="respuesta">(aquí aparece la última respuesta)</pre>
+  </section>
+</main>
+<script>
+const $ = s => document.querySelector(s);
+const campo = $("#api");
+try { campo.value = localStorage.getItem("api-iris") || ""; } catch (e) {}
+const base = () => campo.value.trim().replace(/\/+$/, "");
+
+function estado(texto, bien) { const e = $("#estado"); e.textContent = texto; e.className = bien ? "ok" : "no"; }
+
+async function llamar(ruta, opciones) {
+  if (!base()) { estado("Escribe primero la dirección de la API.", false); throw new Error("sin direccion"); }
+  const url = base() + ruta;
+  let r;
+  try {
+    r = await fetch(url, opciones);
+  } catch (e) {
+    estado("No hubo respuesta: revisa que el codespace esté encendido, que el puerto 52773 sea PÚBLICO y que la dirección sea correcta.", false);
+    $("#respuesta").textContent = String(e);
+    throw e;
+  }
+  const texto = await r.text();
+  $("#respuesta").textContent = "HTTP " + r.status + "\n" + texto;
+  if (!r.ok) { estado("El servidor respondió con error HTTP " + r.status + ".", false); throw new Error("HTTP " + r.status); }
+  return texto ? JSON.parse(texto) : null;
+}
+
+$("#guardarApi").addEventListener("click", () => {
+  try { localStorage.setItem("api-iris", base()); } catch (e) {}
+  estado("Dirección guardada en este navegador.", true);
+});
+$("#ping").addEventListener("click", async () => {
+  const d = await llamar("/ping");
+  estado("Conectado: namespace " + d.namespace + ", hora del servidor " + d.hora, true);
+});
+$("#enviar").addEventListener("click", async () => {
+  const nombre = $("#nombre").value.trim();
+  if (!nombre) { $("#nombre").focus(); return; }
+  const d = await llamar("/prueba", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ nombre }) });
+  estado("Guardado en IRIS con ID " + d.id + ".", true);
+  $("#nombre").value = "";
+  listar();
+});
+async function listar() {
+  const d = await llamar("/prueba");
+  const ul = $("#lista"); ul.textContent = "";
+  d.forEach(x => { const li = document.createElement("li"); li.textContent = x.id + ". " + x.nombre + " (" + x.fecha + ")"; ul.append(li); });
+  if (!d.length) ul.textContent = "Todavía no hay registros.";
+}
+$("#listar").addEventListener("click", listar);
+</script>
+</body>
+</html>
